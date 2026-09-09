@@ -1,293 +1,401 @@
 // ─────────────────────────────────────────────
-// Moonlit Ripple — Moon reflection on dark water with concentric ripple interference
+// Simplex Noise (same compact implementation)
 // ─────────────────────────────────────────────
-(function () {
-  var canvas = document.getElementById('canvas');
-  var prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const SimplexNoise = (function() {
+  const F2 = 0.5 * (Math.sqrt(3) - 1);
+  const G2 = (3 - Math.sqrt(3)) / 6;
+  const F3 = 1 / 3;
+  const G3 = 1 / 6;
 
-  var gl = canvas.getContext('webgl', { alpha: true, antialias: false, preserveDrawingBuffer: false });
-  if (!gl) return;
+  const grad3 = [
+    [1,1,0],[-1,1,0],[1,-1,0],[-1,-1,0],
+    [1,0,1],[-1,0,1],[1,0,-1],[-1,0,-1],
+    [0,1,1],[0,-1,1],[0,1,-1],[0,-1,-1]
+  ];
 
-  var vertSrc = [
-    'attribute vec2 a_pos;',
-    'void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }'
-  ].join('\n');
-
-  var fragSrc = [
-    'precision highp float;',
-    'uniform float u_time;',
-    'uniform vec2 u_res;',
-    'uniform float u_rippleSpeed;',
-    'uniform float u_moonGlow;',
-    'uniform vec2 u_mouse;',
-    'uniform float u_tilt;',
-    'uniform float u_waves;',
-    '',
-    '#define PI 3.14159265359',
-    '#define WAVE_LAYERS 7',
-    '',
-    '// ── Multi-directional waves with analytical normals ──',
-    'vec4 sea(vec2 p, float t) {',
-    '  float h = 0.0;',
-    '  vec2 dh = vec2(0.0);',
-    '  float freq = 1.0;',
-    '  float baseAmp = 0.2 * u_waves;',
-    '  // Higher intensity = slower amplitude decay = more high-freq energy (choppier)',
-    '  float decay = mix(0.55, 0.38, clamp(u_waves / 3.0, 0.0, 1.0));',
-    '  float amp = baseAmp;',
-    '  float angle = 0.0;',
-    '  for (int i = 0; i < WAVE_LAYERS; i++) {',
-    '    float c = cos(angle);',
-    '    float s = sin(angle);',
-    '    // Rotate sampling position per layer (breaks alignment)',
-    '    vec2 pp = vec2(c * p.x + s * p.y, -s * p.x + c * p.y);',
-    '    float fi = float(i);',
-    '    float spd = sqrt(freq) * 0.8;',
-    '    // Sample along y of rotated space + per-layer offset',
-    '    float phase = (pp.y + fi) * freq - t * spd;',
-    '    float sn = sin(phase);',
-    '    float cn = cos(phase);',
-    '    h += sn * amp;',
-    '    // Derivative in rotated space, then rotate back',
-    '    float dy = freq * amp * cn;',
-    '    dh += vec2(-s * dy, c * dy);',
-    '    angle += fi + 1.2;',
-    '    freq *= 1.3;',
-    '    amp *= decay;',
-    '  }',
-    '  vec3 N = normalize(vec3(-dh.x, 1.0, -dh.y));',
-    '  return vec4(h, N);',
-    '}',
-    '',
-    '// ── Moon direction in 3D ──',
-    'vec3 moonDir() {',
-    '  return normalize(vec3(0.15, 0.35, 1.0));',
-    '}',
-    '',
-    '// Simple hash for moon texture',
-    'float hash(vec2 p) {',
-    '  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);',
-    '}',
-    '',
-    '// ── Night sky color with textured moon disc ──',
-    'vec3 skyColor(vec3 rd) {',
-    '  vec3 md = moonDir();',
-    '  // Warm base tones — blue scheme hue-rotates these to cool moonlit blue',
-    '  vec3 skyDark = vec3(0.06, 0.03, 0.02);',
-    '  vec3 skyHoriz = vec3(0.09, 0.05, 0.04);',
-    '  vec3 sky = mix(skyHoriz, skyDark, max(rd.y, 0.0));',
-    '  vec3 moonCol = vec3(0.98, 0.92, 0.85);',
-    '  float moonDot = max(dot(rd, md), 0.0);',
-    '  float moonAngle = acos(clamp(moonDot, 0.0, 1.0));',
-    '  float moonRadius = 0.04;',
-    '  float disc = smoothstep(moonRadius, moonRadius * 0.7, moonAngle);',
-    '  // Crater texture — project rd onto moon-tangent plane',
-    '  if (disc > 0.0) {',
-    '    vec3 up = vec3(0.0, 1.0, 0.0);',
-    '    vec3 right = normalize(cross(up, md));',
-    '    vec3 mup = cross(md, right);',
-    '    vec2 muv = vec2(dot(rd - md, right), dot(rd - md, mup)) * 25.0;',
-    '    float crater = hash(floor(muv * 2.0)) * 0.25;',
-    '    crater += hash(floor(muv * 4.0)) * 0.15;',
-    '    float darkening = 1.0 - crater * smoothstep(moonRadius * 0.9, moonRadius * 0.4, moonAngle);',
-    '    // Slight limb darkening',
-    '    float limb = smoothstep(0.0, moonRadius, moonAngle);',
-    '    darkening *= mix(1.0, 0.7, limb * limb);',
-    '    sky += moonCol * disc * 0.85 * darkening;',
-    '  }',
-    '  // Bloom (scales with moonGlow, disc does not)',
-    '  sky += moonCol * 0.25 * pow(moonDot, 40.0) * u_moonGlow;',
-    '  sky += moonCol * 1.2 * pow(moonDot, 400.0) * u_moonGlow;',
-    '  return sky;',
-    '}',
-    '',
-    'void main() {',
-    '  float aspect = u_res.x / u_res.y;',
-    '  vec2 uv = -1.0 + 2.0 * gl_FragCoord.xy / u_res;',
-    '  uv.x *= aspect;',
-    '  float t = u_time * u_rippleSpeed;',
-    '',
-    '  // ── 3D Camera — tilt: 0=horizontal, 0.5=default, 1=top-down ──',
-    '  float tiltRad = u_tilt * 0.7;',
-    '  vec3 ro = vec3(0.0, 8.0, 0.0);',
-    '  vec3 ww = normalize(vec3(0.0, -sin(tiltRad), cos(tiltRad)));',
-    '  vec3 uu = normalize(cross(vec3(0.0, 1.0, 0.0), ww));',
-    '  vec3 vv = normalize(cross(ww, uu));',
-    '  vec3 rd = normalize(uv.x * uu + uv.y * vv + 2.5 * ww);',
-    '',
-    '  vec3 md = moonDir();',
-    '  vec3 moonCol = vec3(0.98, 0.92, 0.85);',
-    '',
-    '  // ── Sky (above horizon) ──',
-    '  vec3 sky = skyColor(rd);',
-    '  vec3 col = sky;',
-    '',
-    '  // ── Ray-plane intersection (water at y=0) ──',
-    '  float dsea = -ro.y / rd.y;',
-    '',
-    '  if (dsea > 0.0) {',
-    '    vec3 wp = ro + dsea * rd;',
-    '',
-    '    // ── Sample waves ──',
-    '    vec4 s = sea(wp.xz, t);',
-    '    float h = s.x;',
-    '    vec3 nor = s.yzw;',
-    '',
-    '    // ── Mouse ripple — concentric rings that affect normals ──',
-    '    if (u_mouse.x > 0.0) {',
-    '      vec2 mUV = -1.0 + 2.0 * u_mouse / u_res;',
-    '      mUV.x *= aspect;',
-    '      vec3 mrd = normalize(mUV.x * uu + mUV.y * vv + 2.5 * ww);',
-    '      float mdsea = -ro.y / mrd.y;',
-    '      if (mdsea > 0.0) {',
-    '        vec3 mwp = ro + mdsea * mrd;',
-    '        vec2 mdelta = wp.xz - mwp.xz;',
-    '        float md2 = length(mdelta);',
-    '        float mfreq = 4.0;',
-    '        float mphase = md2 * mfreq - t * 5.0;',
-    '        float mamp = exp(-md2 * 0.15) * 0.4 * u_waves;',
-    '        h += sin(mphase) * mamp;',
-    '        // Analytical normal contribution from mouse ripple',
-    '        float mcos = cos(mphase) * mamp * mfreq;',
-    '        vec2 mgrad = md2 > 0.01 ? (mdelta / md2) * mcos : vec2(0.0);',
-    '        nor = normalize(nor + vec3(-mgrad.x, 0.0, -mgrad.y) * 2.0);',
-    '      }',
-    '    }',
-    '    // Flatten normal with distance (perspective detail fade)',
-    '    nor = mix(nor, vec3(0.0, 1.0, 0.0), smoothstep(0.0, 300.0, dsea));',
-    '',
-    '    // ── Fresnel ──',
-    '    float fre = clamp(1.0 - dot(-nor, rd), 0.0, 1.0);',
-    '    fre = pow(fre, 3.0);',
-    '',
-    '    // ── Diffuse moonlight ──',
-    '    float dif = mix(0.25, 1.0, max(dot(nor, md), 0.0));',
-    '',
-    '    // ── Reflection & refraction ──',
-    '    vec3 refl = skyColor(reflect(rd, nor));',
-    '    vec3 seaCol1 = vec3(0.05, 0.02, 0.01);',
-    '    vec3 seaCol2 = vec3(0.10, 0.06, 0.04);',
-    '    vec3 refr = seaCol1 + dif * moonCol * seaCol2 * 0.15 * u_moonGlow;',
-    '',
-    '    col = mix(refr, 0.9 * refl, fre);',
-    '',
-    '    // ── Wave crest highlight ──',
-    '    float atten = max(1.0 - dsea * dsea * 0.0005, 0.0);',
-    '    col += seaCol2 * (wp.y - h) * 1.5 * atten;',
-    '',
-    '    // ── Distance fog (fade to sky at horizon) ──',
-    '    col = mix(col, sky, 1.0 - exp(-0.008 * dsea));',
-    '  }',
-    '',
-    '  // ── Gamma ──',
-    '  col = pow(max(col, vec3(0.0)), vec3(0.85));',
-    '',
-    '  gl_FragColor = vec4(col, 1.0);',
-    '}',
-  ].join('\n');
-
-  function compile(type, src) {
-    var s = gl.createShader(type);
-    gl.shaderSource(s, src);
-    gl.compileShader(s);
-    return s;
-  }
-
-  var prog = gl.createProgram();
-  gl.attachShader(prog, compile(gl.VERTEX_SHADER, vertSrc));
-  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fragSrc));
-  gl.linkProgram(prog);
-  gl.useProgram(prog);
-
-  var buf = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
-  var aPos = gl.getAttribLocation(prog, 'a_pos');
-  gl.enableVertexAttribArray(aPos);
-  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
-
-  var uTime = gl.getUniformLocation(prog, 'u_time');
-  var uRes = gl.getUniformLocation(prog, 'u_res');
-  var uRippleSpeed = gl.getUniformLocation(prog, 'u_rippleSpeed');
-  var uMoonGlow = gl.getUniformLocation(prog, 'u_moonGlow');
-  var uMouse = gl.getUniformLocation(prog, 'u_mouse');
-  var uTilt = gl.getUniformLocation(prog, 'u_tilt');
-  var uWaves = gl.getUniformLocation(prog, 'u_waves');
-  var rippleSpeedVal = 0.5;
-  var moonGlowVal = 1.0;
-  var tiltVal = 0.15;
-  var wavesVal = 1.0;
-  var mouseX = -1.0, mouseY = -1.0;
-
-  var dpr = Math.min(window.devicePixelRatio || 1, 2);
-  var needsResize = true;
-  var running = true;
-
-  function resize() {
-    needsResize = false;
-    var w = Math.round(canvas.clientWidth * dpr);
-    var h = Math.round(canvas.clientHeight * dpr);
-    if (canvas.width !== w || canvas.height !== h) {
-      canvas.width = w;
-      canvas.height = h;
-      gl.viewport(0, 0, w, h);
-      gl.uniform2f(uRes, canvas.width, canvas.height);
+  function SimplexNoise(seed) {
+    this.perm = new Uint8Array(512);
+    this.permMod12 = new Uint8Array(512);
+    const p = new Uint8Array(256);
+    seed = seed || Math.random() * 65536;
+    for (let i = 0; i < 256; i++) p[i] = i;
+    for (let i = 255; i > 0; i--) {
+      seed = (seed * 16807 + 0) % 2147483647;
+      const j = seed % (i + 1);
+      const tmp = p[i];
+      p[i] = p[j];
+      p[j] = tmp;
+    }
+    for (let i = 0; i < 512; i++) {
+      this.perm[i] = p[i & 255];
+      this.permMod12[i] = this.perm[i] % 12;
     }
   }
 
-  function render(now) {
-    if (!running) { requestAnimationFrame(render); return; }
-    if (needsResize) resize();
-    gl.uniform1f(uTime, prefersReduced ? 0.0 : now * 0.001);
-    gl.uniform1f(uRippleSpeed, rippleSpeedVal);
-    gl.uniform1f(uMoonGlow, moonGlowVal);
-    gl.uniform1f(uTilt, tiltVal);
-    gl.uniform1f(uWaves, wavesVal);
-    gl.uniform2f(uMouse, mouseX, mouseY);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-    requestAnimationFrame(render);
+  SimplexNoise.prototype.noise3D = function(xin, yin, zin) {
+    const perm = this.perm, permMod12 = this.permMod12;
+    let n0, n1, n2, n3;
+    const s = (xin + yin + zin) * F3;
+    const i = Math.floor(xin + s), j = Math.floor(yin + s), k = Math.floor(zin + s);
+    const t = (i + j + k) * G3;
+    const X0 = i - t, Y0 = j - t, Z0 = k - t;
+    const x0 = xin - X0, y0 = yin - Y0, z0 = zin - Z0;
+    let i1, j1, k1, i2, j2, k2;
+    if (x0 >= y0) {
+      if (y0 >= z0) { i1=1;j1=0;k1=0;i2=1;j2=1;k2=0; }
+      else if (x0 >= z0) { i1=1;j1=0;k1=0;i2=1;j2=0;k2=1; }
+      else { i1=0;j1=0;k1=1;i2=1;j2=0;k2=1; }
+    } else {
+      if (y0 < z0) { i1=0;j1=0;k1=1;i2=0;j2=1;k2=1; }
+      else if (x0 < z0) { i1=0;j1=1;k1=0;i2=0;j2=1;k2=1; }
+      else { i1=0;j1=1;k1=0;i2=1;j2=1;k2=0; }
+    }
+    const x1 = x0 - i1 + G3, y1 = y0 - j1 + G3, z1 = z0 - k1 + G3;
+    const x2 = x0 - i2 + 2*G3, y2 = y0 - j2 + 2*G3, z2 = z0 - k2 + 2*G3;
+    const x3 = x0 - 1 + 3*G3, y3 = y0 - 1 + 3*G3, z3 = z0 - 1 + 3*G3;
+    const ii = i & 255, jj = j & 255, kk = k & 255;
+    let t0 = 0.6 - x0*x0 - y0*y0 - z0*z0;
+    if (t0 < 0) n0 = 0;
+    else { t0 *= t0; const gi = permMod12[ii+perm[jj+perm[kk]]]; n0 = t0*t0*(grad3[gi][0]*x0+grad3[gi][1]*y0+grad3[gi][2]*z0); }
+    let t1 = 0.6 - x1*x1 - y1*y1 - z1*z1;
+    if (t1 < 0) n1 = 0;
+    else { t1 *= t1; const gi = permMod12[ii+i1+perm[jj+j1+perm[kk+k1]]]; n1 = t1*t1*(grad3[gi][0]*x1+grad3[gi][1]*y1+grad3[gi][2]*z1); }
+    let t2 = 0.6 - x2*x2 - y2*y2 - z2*z2;
+    if (t2 < 0) n2 = 0;
+    else { t2 *= t2; const gi = permMod12[ii+i2+perm[jj+j2+perm[kk+k2]]]; n2 = t2*t2*(grad3[gi][0]*x2+grad3[gi][1]*y2+grad3[gi][2]*z2); }
+    let t3 = 0.6 - x3*x3 - y3*y3 - z3*z3;
+    if (t3 < 0) n3 = 0;
+    else { t3 *= t3; const gi = permMod12[ii+1+perm[jj+1+perm[kk+1]]]; n3 = t3*t3*(grad3[gi][0]*x3+grad3[gi][1]*y3+grad3[gi][2]*z3); }
+    return 32 * (n0 + n1 + n2 + n3);
+  };
+
+  return SimplexNoise;
+})();
+
+// ─────────────────────────────────────────────
+// Topographic Contour Renderer
+// ─────────────────────────────────────────────
+(function() {
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const noise = new SimplexNoise(73);
+  const dpr = window.devicePixelRatio || 1;
+
+  let W, H;
+  let field = new Float32Array(0);
+  let fieldCols = 0;
+  let fieldRows = 0;
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
-  window.addEventListener('resize', function () {
-    needsResize = true;
-  });
-
+  window.addEventListener('resize', resize);
   resize();
 
-  requestAnimationFrame(render);
+  function ensureField(cols, rows) {
+    if (cols !== fieldCols || rows !== fieldRows) {
+      fieldCols = cols;
+      fieldRows = rows;
+      field = new Float32Array(cols * rows);
+    }
+  }
 
-  document.addEventListener('visibilitychange', function () {
-    running = !document.hidden;
-  });
+  // ── Noise sampling with octaves ──
+  function fbm(x, y, z) {
+    let val = 0;
+    let amp = 1;
+    let freq = 1;
+    let sum = 0;
+    for (let o = 0; o < 4; o++) {
+      val += noise.noise3D(x * freq, y * freq, z) * amp;
+      sum += amp;
+      amp *= 0.5;
+      freq *= 2;
+    }
+    return val / sum;
+  }
 
-  canvas.addEventListener('mousemove', function(e) {
-    mouseX = e.clientX * dpr;
-    mouseY = (canvas.clientHeight - e.clientY) * dpr;
-  });
-  canvas.addEventListener('mouseleave', function() {
-    mouseX = -1.0; mouseY = -1.0;
-  });
-  canvas.addEventListener('touchstart', function(e) {
-    var touch = e.touches[0];
-    mouseX = touch.clientX * dpr;
-    mouseY = (canvas.clientHeight - touch.clientY) * dpr;
-  }, { passive: true });
-  canvas.addEventListener('touchmove', function(e) {
-    var touch = e.touches[0];
-    mouseX = touch.clientX * dpr;
-    mouseY = (canvas.clientHeight - touch.clientY) * dpr;
-  }, { passive: true });
-  canvas.addEventListener('touchend', function() {
-    mouseX = -1.0; mouseY = -1.0;
-  });
+  // ── Color helpers (grayscale / mono palette) ──
+  const colors = {
+    amber: { r: 120, g: 120, b: 120 },
+    gold:  { r: 210, g: 210, b: 210 },
+    coral: { r: 70, g: 70, b: 70 },
+  };
+
+  function rgba(c, a) {
+    return 'rgba(' + c.r + ',' + c.g + ',' + c.b + ',' + a + ')';
+  }
+
+  function lerpC(a, b, t) {
+    return {
+      r: Math.round(a.r + (b.r - a.r) * t),
+      g: Math.round(a.g + (b.g - a.g) * t),
+      b: Math.round(a.b + (b.b - a.b) * t)
+    };
+  }
+
+  // ── Marching squares isoline extraction ──
+  function interp(v1, v2, threshold) {
+    if (Math.abs(v2 - v1) < 0.0001) return 0.5;
+    return (threshold - v1) / (v2 - v1);
+  }
+
+  const EDGE_TABLE = [
+    [],
+    [[3, 2]],
+    [[2, 1]],
+    [[3, 1]],
+    [[1, 0]],
+    [[1, 0],[3, 2]],
+    [[2, 0]],
+    [[3, 0]],
+    [[0, 3]],
+    [[0, 2]],
+    [[0, 3],[2, 1]],
+    [[0, 1]],
+    [[1, 3]],
+    [[1, 2]],
+    [[2, 3]],
+    []
+  ];
+
+  function edgePoint(edge, cx, cy, cellW, cellH, tl, tr, br, bl, threshold) {
+    let t;
+    switch (edge) {
+      case 0:
+        t = interp(tl, tr, threshold);
+        return [cx + t * cellW, cy];
+      case 1:
+        t = interp(tr, br, threshold);
+        return [cx + cellW, cy + t * cellH];
+      case 2:
+        t = interp(bl, br, threshold);
+        return [cx + t * cellW, cy + cellH];
+      case 3:
+        t = interp(tl, bl, threshold);
+        return [cx, cy + t * cellH];
+    }
+  }
+
+  // ── Configuration ──
+  const CELL_SIZE = 8;
+  let NUM_CONTOURS = 10;
+  const NOISE_SCALE = 0.003;
+  let TIME_SPEED = 0.04;
+  const LABEL_DENSITY = 0.003;
+
+  let labelCandidates = [];
+
+  let mouseX = 0, mouseY = 0;
+  let mouseActive = false;
+  let mouseDown = false;
+
+  canvas.addEventListener('mousemove', function(e) { mouseX = e.clientX; mouseY = e.clientY; mouseActive = true; });
+  canvas.addEventListener('mouseleave', function() { mouseActive = false; });
+  canvas.addEventListener('mousedown', function(e) { mouseDown = true; mouseX = e.clientX; mouseY = e.clientY; mouseActive = true; });
+  canvas.addEventListener('mouseup', function() { mouseDown = false; });
+  canvas.addEventListener('touchstart', function(e) { e.preventDefault(); mouseDown = true; mouseActive = true; mouseX = e.touches[0].clientX; mouseY = e.touches[0].clientY; }, { passive: false });
+  canvas.addEventListener('touchmove', function(e) { e.preventDefault(); mouseX = e.touches[0].clientX; mouseY = e.touches[0].clientY; }, { passive: false });
+  canvas.addEventListener('touchend', function() { mouseDown = false; mouseActive = false; });
+
+  let time = 0;
+  let lastTime = 0;
+
+  function draw(timestamp) {
+    if (!lastTime) lastTime = timestamp;
+    const dt = (timestamp - lastTime) / 1000;
+    lastTime = timestamp;
+    time += dt * TIME_SPEED;
+
+    ctx.fillStyle = '#0a0a0a';
+    ctx.fillRect(0, 0, W, H);
+
+    const cols = Math.ceil(W / CELL_SIZE) + 1;
+    const rows = Math.ceil(H / CELL_SIZE) + 1;
+    ensureField(cols, rows);
+
+    for (let j = 0; j < rows; j++) {
+      for (let i = 0; i < cols; i++) {
+        const x = i * CELL_SIZE;
+        const y = j * CELL_SIZE;
+        let val = fbm(x * NOISE_SCALE, y * NOISE_SCALE, time);
+        if (mouseActive) {
+          const mdx = x - mouseX;
+          const mdy = y - mouseY;
+          const md = Math.sqrt(mdx * mdx + mdy * mdy);
+          const radius = Math.min(W, H) * 0.2;
+          if (md < radius) {
+            const falloff = 1 - md / radius;
+            val += (mouseDown ? -0.5 : 0.5) * falloff * falloff;
+          }
+        }
+        field[j * cols + i] = val;
+      }
+    }
+
+    let minVal = Infinity, maxVal = -Infinity;
+    for (let k = 0; k < field.length; k++) {
+      if (field[k] < minVal) minVal = field[k];
+      if (field[k] > maxVal) maxVal = field[k];
+    }
+    const range = maxVal - minVal || 1;
+
+    for (let k = 0; k < field.length; k++) {
+      field[k] = (field[k] - minVal) / range;
+    }
+
+    labelCandidates = [];
+
+    for (let c = 0; c < NUM_CONTOURS; c++) {
+      const threshold = (c + 1) / (NUM_CONTOURS + 1);
+
+      let lineColor;
+      if (threshold < 0.5) {
+        lineColor = lerpC(colors.coral, colors.amber, threshold * 2);
+      } else {
+        lineColor = lerpC(colors.amber, colors.gold, (threshold - 0.5) * 2);
+      }
+
+      const distFromCenter = Math.abs(threshold - 0.5) * 2;
+      const baseAlpha = 0.25 + (1 - distFromCenter) * 0.45;
+
+      const isMajor = (c % 5 === 0);
+      const glowWidth = isMajor ? 4.5 : 2.5;
+      const sharpWidth = isMajor ? 1.2 : 0.6;
+      const glowAlpha = baseAlpha * 0.25;
+      const sharpAlpha = baseAlpha * (isMajor ? 1.0 : 0.8);
+
+      const segments = [];
+
+      for (let j = 0; j < rows - 1; j++) {
+        for (let i = 0; i < cols - 1; i++) {
+          const tl = field[j * cols + i];
+          const tr = field[j * cols + i + 1];
+          const br = field[(j + 1) * cols + i + 1];
+          const bl = field[(j + 1) * cols + i];
+
+          const caseIdx =
+            (tl >= threshold ? 8 : 0) |
+            (tr >= threshold ? 4 : 0) |
+            (br >= threshold ? 2 : 0) |
+            (bl >= threshold ? 1 : 0);
+
+          const edges = EDGE_TABLE[caseIdx];
+          if (!edges || edges.length === 0) continue;
+
+          const cx = i * CELL_SIZE;
+          const cy = j * CELL_SIZE;
+
+          for (let e = 0; e < edges.length; e++) {
+            const p1 = edgePoint(edges[e][0], cx, cy, CELL_SIZE, CELL_SIZE, tl, tr, br, bl, threshold);
+            const p2 = edgePoint(edges[e][1], cx, cy, CELL_SIZE, CELL_SIZE, tl, tr, br, bl, threshold);
+            segments.push(p1[0], p1[1], p2[0], p2[1]);
+
+            if (isMajor && Math.random() < LABEL_DENSITY) {
+              const mx = (p1[0] + p2[0]) * 0.5;
+              const my = (p1[1] + p2[1]) * 0.5;
+              const angle = Math.atan2(p2[1] - p1[1], p2[0] - p1[0]);
+              labelCandidates.push({
+                x: mx, y: my,
+                angle: angle,
+                elevation: Math.round(threshold * 1000),
+                color: lineColor,
+                alpha: sharpAlpha * 0.6
+              });
+            }
+          }
+        }
+      }
+
+      if (segments.length > 0) {
+        ctx.beginPath();
+        for (let s = 0; s < segments.length; s += 4) {
+          ctx.moveTo(segments[s], segments[s+1]);
+          ctx.lineTo(segments[s+2], segments[s+3]);
+        }
+        ctx.strokeStyle = rgba(lineColor, glowAlpha);
+        ctx.lineWidth = glowWidth;
+        ctx.lineCap = 'round';
+        ctx.stroke();
+
+        ctx.beginPath();
+        for (let s = 0; s < segments.length; s += 4) {
+          ctx.moveTo(segments[s], segments[s+1]);
+          ctx.lineTo(segments[s+2], segments[s+3]);
+        }
+        ctx.strokeStyle = rgba(lineColor, sharpAlpha);
+        ctx.lineWidth = sharpWidth;
+        ctx.lineCap = 'round';
+        ctx.stroke();
+      }
+    }
+
+    const MIN_LABEL_DIST = 120;
+    const filteredLabels = [];
+    for (let i = 0; i < labelCandidates.length; i++) {
+      const lbl = labelCandidates[i];
+      if (lbl.x < 80 || lbl.x > W - 80 || lbl.y < 40 || lbl.y > H - 40) continue;
+      let tooClose = false;
+      for (let j = 0; j < filteredLabels.length; j++) {
+        const dx = lbl.x - filteredLabels[j].x;
+        const dy = lbl.y - filteredLabels[j].y;
+        if (dx * dx + dy * dy < MIN_LABEL_DIST * MIN_LABEL_DIST) {
+          tooClose = true;
+          break;
+        }
+      }
+      if (!tooClose) filteredLabels.push(lbl);
+    }
+
+    ctx.font = '9px "SF Mono", "Fira Code", "Cascadia Code", monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    for (let i = 0; i < filteredLabels.length; i++) {
+      const lbl = filteredLabels[i];
+      const text = lbl.elevation.toString();
+      const tw = ctx.measureText(text).width + 6;
+
+      ctx.save();
+      ctx.translate(lbl.x, lbl.y);
+
+      let angle = lbl.angle;
+      if (angle > Math.PI / 2) angle -= Math.PI;
+      if (angle < -Math.PI / 2) angle += Math.PI;
+      ctx.rotate(angle);
+
+      ctx.fillStyle = 'rgba(10, 10, 10, 0.85)';
+      ctx.fillRect(-tw / 2, -6, tw, 12);
+
+      ctx.fillStyle = rgba(lbl.color, lbl.alpha);
+      ctx.fillText(text, 0, 0.5);
+
+      ctx.restore();
+    }
+
+    const vGrad = ctx.createRadialGradient(W/2, H/2, Math.min(W, H) * 0.3, W/2, H/2, Math.max(W, H) * 0.75);
+    vGrad.addColorStop(0, 'rgba(10,10,10,0)');
+    vGrad.addColorStop(1, 'rgba(10,10,10,0.4)');
+    ctx.fillStyle = vGrad;
+    ctx.fillRect(0, 0, W, H);
+
+    requestAnimationFrame(draw);
+  }
+
+  requestAnimationFrame(draw);
 
   window.addEventListener('message', function(e) {
     if (e.data && e.data.type === 'param') {
       switch (e.data.name) {
-        case 'RIPPLE_SPEED': rippleSpeedVal = e.data.value; break;
-        case 'MOON_GLOW': moonGlowVal = e.data.value; break;
-        case 'CAMERA_TILT': tiltVal = e.data.value; break;
-        case 'WAVE_INTENSITY': wavesVal = e.data.value; break;
+        case 'NUM_CONTOURS': NUM_CONTOURS = Math.round(e.data.value); break;
+        case 'TIME_SPEED': TIME_SPEED = e.data.value; break;
       }
     }
   });
